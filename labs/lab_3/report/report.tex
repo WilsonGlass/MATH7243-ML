@@ -1,0 +1,815 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+
+\lstset{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue!70!black},
+  commentstyle=\color{green!40!black},
+  stringstyle=\color{red!60!black},
+  frame=single,
+  breaklines=true,
+  showstringspaces=false,
+  columns=fullflexible,
+}
+
+\title{MATH 7243 --- Lab 3: Linear Methods in Classification}
+\author{Wilson Glass}
+\date{October 21, 2026}
+
+\begin{document}
+\maketitle
+
+%=============================================================================
+\section*{Problem 1: Gender Recognition by Voice}
+
+\subsection*{Setup}
+
+The dataset contains 3168 voice recordings, each described by 20 acoustic features
+(\texttt{meanfreq}, \texttt{sd}, \texttt{median}, \texttt{Q25}, \texttt{Q75},
+\texttt{IQR}, \texttt{skew}, \texttt{kurt}, \texttt{sp.ent}, \texttt{sfm}, \texttt{mode},
+\texttt{centroid}, \texttt{meanfun}, \texttt{minfun}, \texttt{maxfun}, \texttt{meandom},
+\texttt{mindom}, \texttt{maxdom}, \texttt{dfrange}, \texttt{modindx}) and labelled
+\texttt{male} or \texttt{female}. Following the Master notebook, every feature is
+normalized by centering on its mean and dividing by its standard deviation.
+
+\begin{lstlisting}
+import pandas as pd
+import numpy as np
+from matplotlib import pyplot as plt
+import seaborn as sns
+
+data = pd.read_csv("voice.csv")
+
+X = data.drop(columns=["label"])
+y = data["label"]
+X = (X - X.mean()) / X.std()      # normalize each feature
+\end{lstlisting}
+
+%-----------------------------------------------------------------------------
+\subsection*{Question 1, Part 1: Exploratory Analysis}
+
+\subsubsection*{Class balance}
+
+\begin{lstlisting}
+display(y.value_counts())
+sns.countplot(x="label", data=data)
+\end{lstlisting}
+
+The classes are exactly balanced: 1584 male and 1584 female recordings. So a classifier
+that always guesses one label gets 50\% accuracy, and plain accuracy is a fair metric
+for this problem.
+
+\subsubsection*{Correlation among the features}
+
+\begin{lstlisting}
+sns.heatmap(X.corr(), annot=True, linewidth=.5, fmt='.1f', annot_kws={"size": 7})
+\end{lstlisting}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.85\textwidth]{figures/p1_corr.png}
+  \caption{Correlation between the 20 normalized features.}
+\end{figure}
+
+Many of the features are redundant:
+\begin{itemize}
+  \item \texttt{centroid} and \texttt{meanfreq} have correlation $1.0$. They are the same
+  feature in this dataset.
+  \item \texttt{skew} and \texttt{kurt} ($1.0$), and \texttt{maxdom} and \texttt{dfrange}
+  ($1.0$), are also near-duplicates.
+  \item The frequency-quantile features \texttt{meanfreq}, \texttt{median}, \texttt{Q25}
+  and \texttt{centroid} form a block with correlations of $0.8$--$1.0$. \texttt{sd},
+  \texttt{IQR}, \texttt{sp.ent} and \texttt{sfm} form a second block that is negatively
+  correlated with the first.
+  \item Several features are exact linear combinations of others:
+  $\texttt{IQR} = \texttt{Q75} - \texttt{Q25}$ and
+  $\texttt{dfrange} = \texttt{maxdom} - \texttt{mindom}$.
+\end{itemize}
+This redundancy matters for Question 2: adding all 20 features gives a model much less new
+information than the count suggests.
+
+\subsubsection*{Correlation within each class}
+
+As in the Master notebook, we compute the correlation matrix separately for male and
+female voices, on a shared color scale, and take their difference.
+
+\begin{lstlisting}
+I_m = y == "male"
+I_f = y == "female"
+
+vmin = min(X[I_m].corr().min().min(), X[I_f].corr().min().min())
+vmax = max(X[I_m].corr().max().max(), X[I_f].corr().max().max())
+
+f, axes = plt.subplots(1, 2, figsize=(20, 8))
+sns.heatmap(X[I_m].corr(), annot=True, fmt='.1f', ax=axes[0], vmin=vmin, vmax=vmax)
+sns.heatmap(X[I_f].corr(), annot=True, fmt='.1f', ax=axes[1], vmin=vmin, vmax=vmax)
+
+sns.heatmap(X[I_m].corr() - X[I_f].corr(), annot=True, fmt='.1f')
+\end{lstlisting}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\textwidth]{figures/p1_corr_by_class.png}
+  \caption{Feature correlations for male (left) and female (right) voices.}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.7\textwidth]{figures/p1_corr_diff.png}
+  \caption{Difference of the two class correlation matrices (male $-$ female).}
+\end{figure}
+
+Most of the correlation structure is the same for both genders: the difference matrix is
+mostly within $\pm 0.2$. The largest differences involve \texttt{meanfun}, which is
+correlated with \texttt{meandom}, \texttt{maxdom} and \texttt{dfrange} for male voices
+(difference $0.4$--$0.5$) but not for female voices, and \texttt{sp.ent}, whose
+correlation with \texttt{IQR} and \texttt{Q25} changes by up to $0.5$. Because the two
+classes have different covariance structure, a method like QDA, which fits a separate
+covariance matrix to each class, could have an advantage over methods that assume one
+shared covariance.
+
+\clearpage
+\subsubsection*{Distributions by class}
+
+\begin{lstlisting}
+vio = pd.concat([y, X], axis=1)
+vio = pd.melt(vio, id_vars="label", var_name="features", value_name="value")
+
+sns.violinplot(x="features", y="value", hue="label", data=vio, split=True, inner="quart")
+sns.boxplot(x="features", y="value", hue="label", data=vio)
+\end{lstlisting}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\textwidth]{figures/p1_violin_box_0.png}
+  \includegraphics[width=\textwidth]{figures/p1_violin_box_1.png}
+  \caption{Violin plots (top) and box plots (bottom) of each normalized feature, split by
+  label.}
+\end{figure}
+
+The Master notebook's swarm plot did not work for this data. Several features
+(\texttt{maxfun}, \texttt{mindom}, \texttt{modindx}) take only a few distinct values, and a
+swarm plot cannot place that many tied points side by side: seaborn reported that up to
+70\% of the points could not be placed. We use a jittered strip plot on a random subsample
+of 500 recordings instead.
+
+\begin{lstlisting}
+vio_s = pd.concat([y, X], axis=1).sample(500, random_state=0)
+vio_s = pd.melt(vio_s, id_vars="label", var_name="features", value_name="value")
+
+sns.stripplot(x="features", y="value", hue="label", data=vio_s,
+              size=2, jitter=0.3, dodge=True, alpha=.6)
+\end{lstlisting}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\textwidth]{figures/p1_strip.png}
+  \caption{Strip plot of 500 randomly chosen recordings.}
+\end{figure}
+
+\texttt{meanfun} stands out in all three plots: the male and female distributions barely
+overlap, with male voices well below the mean and female voices above it. \texttt{IQR},
+\texttt{Q25}, \texttt{sd}, \texttt{sp.ent} and \texttt{sfm} also show clearly shifted
+medians, but with much more overlap. Features such as \texttt{skew}, \texttt{kurt},
+\texttt{Q75} and \texttt{modindx} look almost the same for both classes.
+
+%-----------------------------------------------------------------------------
+\clearpage
+\subsection*{Question 1, Part 2: Most Indicative Features}
+
+To rank the features by how well they separate the genders, we compute three measures for
+each one:
+\begin{itemize}
+  \item the gap between the male and female means (in standard deviations, since $X$ is
+  normalized);
+  \item the absolute correlation with the 0/1 label;
+  \item the 5-fold cross-validated accuracy of a logistic regression that uses only that
+  one feature.
+\end{itemize}
+
+\begin{lstlisting}
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+
+y_num = (y == "male").astype(int)
+
+rank = pd.DataFrame({
+    "mean_diff": (X[I_m].mean() - X[I_f].mean()).abs(),
+    "corr_w_label": X.corrwith(y_num).abs(),
+    "single_feat_acc": [cross_val_score(LogisticRegression(), X[[c]], y, cv=5).mean()
+                        for c in X.columns],
+}).sort_values("single_feat_acc", ascending=False)
+\end{lstlisting}
+
+\begin{center}
+\begin{tabular}{lccc}
+\toprule
+Feature & Mean gap (SD) & $|$corr with label$|$ & Single-feature CV accuracy \\
+\midrule
+\texttt{meanfun} & 1.668 & 0.834 & 0.950 \\
+\texttt{IQR}     & 1.238 & 0.619 & 0.887 \\
+\texttt{Q25}     & 1.023 & 0.511 & 0.821 \\
+\texttt{sd}      & 0.959 & 0.480 & 0.754 \\
+\texttt{sp.ent}  & 0.981 & 0.491 & 0.735 \\
+\texttt{sfm}     & 0.715 & 0.357 & 0.651 \\
+\midrule
+\texttt{skew}    & 0.073 & 0.037 & 0.448 \\
+\texttt{modindx} & 0.062 & 0.031 & 0.441 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.5\textwidth]{figures/p1_top2.png}
+  \caption{The two most indicative features, \texttt{meanfun} and \texttt{IQR}.}
+\end{figure}
+
+\textbf{Answer:} The two most indicative features are \textbf{\texttt{meanfun}} and
+\textbf{\texttt{IQR}}. All three measures rank them first and second.
+\begin{itemize}
+  \item \texttt{meanfun}, the average fundamental frequency, measures the pitch of the
+  voice. On its own it classifies 95.0\% of recordings correctly, and its class means are
+  1.67 standard deviations apart.
+  \item \texttt{IQR}, the interquartile range of the frequency spectrum, gets 88.7\%
+  alone. Male voices have a wider spread of frequencies (higher \texttt{IQR}).
+  \item \texttt{Q25} is a close third, but it is strongly correlated with \texttt{IQR}
+  ($-0.9$), so it would add little as a second feature. \texttt{IQR} is only moderately
+  correlated with \texttt{meanfun} ($-0.5$), so it does add new information.
+\end{itemize}
+In the scatter plot the two classes form two clearly separated clusters: males at low
+\texttt{meanfun} and high \texttt{IQR}, females at high \texttt{meanfun} and low
+\texttt{IQR}.
+
+%-----------------------------------------------------------------------------
+\clearpage
+\subsection*{Question 2: Linear Regression, Logistic Regression and QDA}
+
+\subsubsection*{Setup}
+
+We split the data once into 70\% training and 30\% test data (stratified by label), so that
+the two-feature and all-feature models are evaluated on the same 951 test recordings.
+
+Linear regression is used as a classifier as in the Master notebook. We regress on the
+one-hot (dummy) labels and predict the class whose column has the larger fitted value. We
+wrap it in a small class so it has the same \texttt{predict}/\texttt{score} interface as
+the sklearn classifiers.
+
+\begin{lstlisting}
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
+from sklearn.model_selection import train_test_split
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3,
+                                                    stratify=y, random_state=0)
+feats2 = ["meanfun", "IQR"]
+
+class LinRegClassifier:
+    def fit(self, X, y):
+        Y = pd.get_dummies(y)
+        self.classes_ = Y.columns.to_numpy()
+        self.lr = LinearRegression().fit(X, Y.astype(float))
+        return self
+
+    def predict(self, X):
+        return self.classes_[np.argmax(self.lr.predict(X), axis=1)]
+
+    def predict_proba(self, X):
+        return self.lr.predict(X)
+
+    def score(self, X, y):
+        return np.mean(self.predict(X) == np.asarray(y))
+\end{lstlisting}
+
+\subsubsection*{Two-feature fits}
+
+\begin{lstlisting}
+models2 = {
+    "Linear Regression": LinRegClassifier(),
+    "Logistic Regression": LogisticRegression(),
+    "QDA": QuadraticDiscriminantAnalysis(store_covariance=True),
+}
+for name, m in models2.items():
+    m.fit(X_train[feats2], y_train)
+\end{lstlisting}
+
+The decision regions are drawn by predicting on a $200 \times 200$ grid covering the data
+and shading each grid point by its predicted label.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\textwidth]{figures/p1_boundaries.png}
+  \caption{Decision boundaries on \texttt{meanfun} and \texttt{IQR}, with the test
+  recordings. Blue region: predicted male; orange region: predicted female.}
+\end{figure}
+
+Linear and logistic regression draw almost the same straight line. It tilts upward: a voice
+with a larger \texttt{IQR} needs a higher \texttt{meanfun} to be labelled female. QDA's
+boundary is a curve that wraps around the male cluster. The male cluster is much tighter
+than the female one, and QDA's separate class covariances let the boundary bend around it.
+A small second group of females at high \texttt{IQR} (around 2) is on the female side
+for every model. Most errors come from the region where the clusters overlap, near
+$\texttt{meanfun} \approx 0$.
+
+\subsubsection*{All-feature fits}
+
+Since \texttt{centroid} $=$ \texttt{meanfreq}, $\texttt{IQR} = \texttt{Q75} - \texttt{Q25}$
+and $\texttt{dfrange} = \texttt{maxdom} - \texttt{mindom}$, the class covariance matrices
+are singular when all 20 features are used. A small regularization parameter keeps QDA well
+defined, and logistic regression is given more iterations so it converges.
+
+\begin{lstlisting}
+models_all = {
+    "Linear Regression": LinRegClassifier(),
+    "Logistic Regression": LogisticRegression(max_iter=1000),
+    "QDA": QuadraticDiscriminantAnalysis(reg_param=0.01),
+}
+for name, m in models_all.items():
+    m.fit(X_train, y_train)
+\end{lstlisting}
+
+A 20-dimensional decision boundary cannot be drawn. Instead, we graph each model's fitted
+``male'' score on the test set (the predicted probability for logistic regression and QDA,
+the fitted dummy value for linear regression), split by true label.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\textwidth]{figures/p1_score_hist.png}
+  \caption{Fitted male score on the test set by true label, for two features (top) and all
+  features (bottom). The dashed line is the decision threshold.}
+\end{figure}
+
+\subsubsection*{Results}
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+ & \multicolumn{2}{c}{2 features} & \multicolumn{2}{c}{All 20 features} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+Model & Train & Test & Train & Test \\
+\midrule
+Linear Regression   & 0.965 & 0.956 & 0.973 & 0.962 \\
+Logistic Regression & 0.968 & 0.960 & 0.978 & \textbf{0.965} \\
+QDA                 & 0.969 & \textbf{0.962} & 0.973 & 0.959 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+ & \multicolumn{2}{c}{2 features} & \multicolumn{2}{c}{All 20 features} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+Model & male $\to$ female & female $\to$ male & male $\to$ female & female $\to$ male \\
+\midrule
+Linear Regression   & 13 & 29 & 15 & 21 \\
+Logistic Regression & 16 & 22 & 17 & 16 \\
+QDA                 & 17 & 19 & 22 & 17 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\noindent (Number of the 951 test recordings misclassified in each direction.)
+
+\subsubsection*{How the two-feature fit compares to the fit on all features}
+
+\begin{itemize}
+  \item \textbf{Two features already give almost all of the accuracy.} With only
+  \texttt{meanfun} and \texttt{IQR}, every method classifies about 96\% of test recordings
+  correctly. QDA is the best two-feature model (96.2\%), but only slightly.
+  \item \textbf{All 20 features add very little.} Linear and logistic regression improve by
+  only about half a percentage point (to 96.2\% and 96.5\%), and QDA gets slightly
+  \emph{worse} (96.2\% $\to$ 95.9\%). As the correlation heatmap shows, the other features
+  are mostly near-copies of each other or carry little class information, so they add almost
+  nothing beyond \texttt{meanfun}.
+  \item \textbf{QDA overfits with all features.} It has to estimate two full $20 \times 20$
+  covariance matrices. Its train/test gap grows from 0.7 points to 1.4 points. Its score
+  histogram shows the same thing: it pushes nearly every recording to a probability of
+  exactly 0 or 1, including the ones it gets wrong.
+  \item \textbf{Logistic regression benefits most} from the extra features, cutting females
+  mislabelled as male from 22 to 16. Linear regression's errors are lopsided with two
+  features (29 females labelled male vs.\ 13 males labelled female), and the extra features
+  partly correct this.
+  \item Linear regression's scores are not probabilities. They run from about $-0.6$ to
+  $1.6$, and its overlap around the threshold is wider than logistic regression's.
+  \item \textbf{Caveat:} with 951 test points, one standard error of accuracy is about
+  $\sqrt{0.04 \cdot 0.96 / 951} \approx 0.6$ points. So the differences between the three
+  methods, and between 2 and 20 features, are all within noise for this single split.
+\end{itemize}
+
+\textbf{Conclusion.} Two well-chosen features give essentially all of the classification
+power (about 96\%), and a model whose decision boundary can be plotted and interpreted.
+Adding the other 18 features buys at most about half a point of accuracy, makes the model
+uninterpretable, and in the case of QDA introduces overfitting.
+
+%=============================================================================
+\clearpage
+\section*{Problem 2: Alzheimer MRI Classification}
+
+\subsection*{Setup}
+
+The Alzheimer4 dataset contains MRI brain slices in four classes, already split into
+training and test folders:
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+ & NonDemented & VeryMildDemented & MildDemented & ModerateDemented \\
+\midrule
+Label & 0 & 1 & 2 & 3 \\
+Train & 2560 & 1792 & 717 & 52 \\
+Test  & 640  & 448  & 179 & 12 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The classes are very unbalanced: NonDemented is half of the data and ModerateDemented
+only 1\%. A model that always predicts NonDemented gets 50\% accuracy. So besides accuracy we
+report \textbf{balanced accuracy}, the average of the four per-class recalls, for which
+that trivial model scores 25\%.
+
+Each image is grayscale, $176 \times 208$ pixels, and is resized to $128 \times 128$. The
+lab's starter code repeated the same loading loop for each of the four class folders. We
+replace it with a single function that loads a whole split.
+
+\begin{lstlisting}
+DATA_DIR = "data/AlzheimerDataset4/Alzheimer_s Dataset"
+CLASSES = ["NonDemented", "VeryMildDemented", "MildDemented", "ModerateDemented"]
+IMG_SIZE = (128, 128)
+
+def load_split(split):
+    data, labels, paths = [], [], []
+    for label, cls in enumerate(CLASSES):
+        folder = os.path.join(DATA_DIR, split, cls)
+        for filename in sorted(os.listdir(folder)):
+            path = os.path.join(folder, filename)
+            img = np.array(Image.open(path).resize(IMG_SIZE))
+            if img.shape == IMG_SIZE:          # skip any non-grayscale images
+                data.append(img)
+                labels.append(label)
+                paths.append(path)
+    return np.array(data), np.array(labels), paths
+
+train_data, train_y, train_paths = load_split("train")
+train_label = np.eye(len(CLASSES))[train_y]          # one-hot, shape (5121, 4)
+\end{lstlisting}
+
+%-----------------------------------------------------------------------------
+\subsection*{Question 1: Import the Test Dataset}
+
+With the loader function, importing the test set is a single call:
+
+\begin{lstlisting}
+test_data, test_y, test_paths = load_split("test")
+test_label = np.eye(len(CLASSES))[test_y]
+\end{lstlisting}
+
+This gives \texttt{test\_data} of shape $(1279, 128, 128)$ and \texttt{test\_label} of
+shape $(1279, 4)$, matching the expected size. Training and test images come from the
+provided folders, so the split was fixed before any processing.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.45\textwidth]{figures/p2_example.png}
+  \caption{One training image. Pixel values range from 0 to 255.}
+\end{figure}
+
+%-----------------------------------------------------------------------------
+\clearpage
+\subsection*{Question 2: LDA, QDA, Logistic Regression and Categorical Linear Regression}
+
+\subsubsection*{Setup}
+
+Each $128 \times 128$ image is flattened into a row of 16{,}384 pixels and scaled to
+$[0, 1]$. Categorical linear regression regresses on the one-hot labels and predicts the
+class with the largest fitted value.
+
+\begin{lstlisting}
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis, QuadraticDiscriminantAnalysis
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.decomposition import PCA
+from sklearn.pipeline import make_pipeline
+
+X_train = (train_data.reshape(len(train_data), -1) / 255).astype(np.float32)
+X_test  = (test_data.reshape(len(test_data), -1) / 255).astype(np.float32)
+
+class LinRegClassifier:
+    def fit(self, X, y):
+        self.lr = LinearRegression().fit(X, np.eye(len(CLASSES))[y])
+        return self
+
+    def predict(self, X):
+        return np.argmax(self.lr.predict(X), axis=1)
+
+models = {
+    "LDA": LinearDiscriminantAnalysis(),
+    "QDA (on 40 PCA components)": make_pipeline(PCA(n_components=40, random_state=0),
+                                                QuadraticDiscriminantAnalysis(reg_param=0.1)),
+    "Logistic Regression": LogisticRegression(max_iter=500),
+    "Categorical Linear Regression": LinRegClassifier(),
+}
+for name, m in models.items():
+    m.fit(X_train, train_y)
+\end{lstlisting}
+
+\textbf{QDA needs dimension reduction.} QDA estimates a separate $16384 \times 16384$
+covariance matrix for each class, but every class has fewer images than pixels, so these
+matrices are singular. scikit-learn refuses to fit it (\texttt{LinAlgError: The covariance
+matrix of class 0 is not full rank}). Its suggested alternative, the \texttt{eigen} solver
+with shrinkage, would have to decompose four $16384 \times 16384$ matrices, which is
+impractical. Instead, we project the images onto their top 40 principal components (PCA fitted
+on the training set only) and run QDA there. We chose 40 because the smallest class,
+ModerateDemented, has just 52 training images, and each class needs more samples than
+dimensions.
+
+\subsubsection*{Results}
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+Model & Train acc & Test acc & Train balanced & Test balanced \\
+\midrule
+LDA                           & 1.000 & 0.396 & 1.000 & 0.290 \\
+QDA (40 PCA components)       & 0.793 & 0.535 & 0.851 & 0.369 \\
+Logistic Regression           & 1.000 & \textbf{0.598} & 1.000 & 0.365 \\
+Categorical Linear Regression & 1.000 & 0.561 & 1.000 & \textbf{0.449} \\
+\midrule
+Always ``NonDemented''        & --- & 0.500 & --- & 0.250 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.82\textwidth]{figures/p2_confusion.png}
+  \caption{Confusion matrices on the training set (left) and test set (right). Rows are the
+  true class, columns the predicted class.}
+\end{figure}
+
+\subsubsection*{Confusion matrices}
+
+Rows are the true class and columns the predicted class, in the order Non, VeryMild, Mild,
+Moderate.
+\[
+\begin{array}{lcc}
+ & \text{Train} & \text{Test} \\[4pt]
+\text{LDA} &
+\begin{pmatrix} 2560&0&0&0\\0&1792&0&0\\0&0&717&0\\0&0&0&52 \end{pmatrix} &
+\begin{pmatrix} 480&12&15&133\\304&14&17&113\\108&6&8&57\\7&1&0&4 \end{pmatrix} \\[24pt]
+\text{QDA} &
+\begin{pmatrix} 2115&318&127&0\\423&1275&94&0\\36&60&621&0\\0&0&0&52 \end{pmatrix} &
+\begin{pmatrix} 411&221&8&0\\192&252&4&0\\46&114&19&0\\0&10&0&2 \end{pmatrix} \\[24pt]
+\text{Logistic} &
+\begin{pmatrix} 2560&0&0&0\\0&1792&0&0\\0&0&717&0\\0&0&0&52 \end{pmatrix} &
+\begin{pmatrix} 497&140&3&0\\202&242&4&0\\71&82&26&0\\6&6&0&0 \end{pmatrix} \\[24pt]
+\text{Linear Reg.} &
+\begin{pmatrix} 2560&0&0&0\\0&1792&0&0\\0&0&717&0\\0&0&0&52 \end{pmatrix} &
+\begin{pmatrix} 425&197&18&0\\186&242&20&0\\59&74&46&0\\6&2&0&4 \end{pmatrix}
+\end{array}
+\]
+
+The per-class test recall (the diagonal divided by the row total) is:
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+Model & Non & VeryMild & Mild & Moderate \\
+\midrule
+LDA                 & 0.75 & 0.03 & 0.04 & 0.33 \\
+QDA                 & 0.64 & 0.56 & 0.11 & 0.17 \\
+Logistic Regression & 0.78 & 0.54 & 0.15 & 0.00 \\
+Linear Regression   & 0.66 & 0.54 & 0.26 & 0.33 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection*{Discussion}
+
+\begin{itemize}
+  \item \textbf{Overfitting dominates.} There are 16{,}384 pixel features but only 5121
+  training images. LDA, logistic regression and linear regression all reach 100\% training
+  accuracy, with perfectly diagonal training confusion matrices, but only 40--60\% on the test
+  set. With more features than samples the training classes are linearly separable, so these
+  models memorize the training images instead of learning patterns that generalize. QDA on 40
+  PCA components has far fewer effective parameters. It is the only model that does not fit
+  the training set perfectly (79\%), and it has the smallest train/test gap (26 points vs.\
+  40--60).
+  \item \textbf{Test performance is only modestly better than guessing.} The best test
+  accuracy, logistic regression's 59.8\%, is about 10 points above the 50\% baseline. LDA does
+  \emph{worse} than the baseline: it labels 307 test images as ModerateDemented, although
+  only 12 are. Its discriminant directions were fitted to noise in the 16{,}384-dimensional
+  pixel space and do not transfer to new images.
+  \item \textbf{Accuracy and balanced accuracy rank the models differently.} Logistic
+  regression has the best accuracy because it favours the large classes, but it never
+  predicts ModerateDemented (0 of 12 correct). Categorical linear regression has the best
+  balanced accuracy (0.449). It recovers the most MildDemented images (26\%) and 4 of the 12
+  ModerateDemented images, at the cost of more NonDemented errors.
+  \item \textbf{Errors are mostly between neighbouring stages.} In every test confusion
+  matrix, most mistakes are NonDemented $\leftrightarrow$ VeryMildDemented, and MildDemented
+  images are mostly labelled VeryMild or Non rather than Moderate. Dementia severity is a
+  continuum, and adjacent stages look very similar on a single MRI slice. The models largely
+  separate ``no'' from ``some'' dementia but struggle to grade the severity.
+\end{itemize}
+
+\textbf{Conclusion.} No linear method works well on raw pixels. Logistic regression gives
+the highest accuracy and categorical linear regression the best balance across classes. QDA
+is only feasible after dimension reduction, which also makes it the least overfit. LDA is
+the worst, since it cannot estimate a pooled covariance from 5121 samples in 16{,}384
+dimensions. Reducing the number of features (downsampling or PCA), regularizing, or
+reweighting the classes (\texttt{class\_weight="balanced"}) would be natural next steps.
+
+%-----------------------------------------------------------------------------
+\clearpage
+\subsection*{Question 3 (Bonus): Downsampling}
+
+\subsubsection*{Modifying the downsample function}
+
+The provided \texttt{downsample} function splits each image into \texttt{DS} new images by
+taking every \texttt{DS}-th pixel with a different starting offset:
+row $n \cdot \texttt{DS} + i$ of the new array is \texttt{X[n, i::DS]}. We made four changes:
+\begin{itemize}
+  \item The image size is read from \texttt{X} instead of being hard-coded as 123{,}008.
+  Our flattened images have $128 \times 128 = 16{,}384$ pixels.
+  \item \texttt{y} is a numpy array here, so \texttt{y.to\_list()} is no longer needed.
+  \item The double loop is replaced by an equivalent reshape, which is much faster.
+  \item The function also returns which original image each new row came from, so that the
+  \texttt{DS} predictions for each test image can be combined by majority vote.
+\end{itemize}
+
+\begin{lstlisting}
+def downsample(X, y, DS):
+    N, im_size = X.shape
+
+    if im_size % DS > 0:
+        print("Downsample rate is not a divisor of", im_size)
+        DS = 1
+
+    # (N, im_size) -> (N, im_size/DS, DS) -> swap last two axes -> rows X[n, i::DS]
+    Xds = X.reshape(N, im_size // DS, DS).transpose(0, 2, 1).reshape(N * DS, im_size // DS)
+    yds = np.repeat(y, DS)
+    groups = np.repeat(np.arange(N), DS)
+
+    return Xds, yds, groups
+
+DS = 8
+Xds_train, yds_train, g_train = downsample(X_train, train_y, DS)
+Xds_test,  yds_test,  g_test  = downsample(X_test,  test_y,  DS)
+
+assert np.array_equal(Xds_train[3*DS + 5], X_train[3, 5::DS])   # matches the loop definition
+\end{lstlisting}
+
+With $\texttt{DS} = 8$ each image becomes 8 images of 2048 pixels, giving 40{,}968 training
+rows and 10{,}232 test rows. As the lab requires, train and test were split
+\emph{before} downsampling, so no sub-image of a test image is ever seen in training. Since
+128 is divisible by 8, taking every 8th pixel of the flattened image keeps every 8th
+\emph{column} in each row. So each new image is $128 \times 16$ pixels, and the 8 images
+are horizontally shifted copies of the original.
+
+\begin{figure}[H]
+  \centering
+  \vspace{0.5em}
+  \includegraphics[width=0.7\textwidth]{figures/p2_ds_example.png}
+  \caption{An original image and two of its eight downsampled versions.}
+\end{figure}
+
+\clearpage
+\subsubsection*{Models on the downsampled data}
+
+The same four models are fit to the downsampled rows. QDA still uses 40 PCA components,
+because the smallest class has only $52 \times 8 = 416$ rows, fewer than the 2048 features.
+Each test image is then classified by a majority vote over its 8 sub-images.
+
+\begin{lstlisting}
+def vote(pred, groups):
+    counts = np.zeros((groups.max() + 1, len(CLASSES)))
+    np.add.at(counts, (groups, pred.astype(int)), 1)
+    return counts.argmax(axis=1)
+
+for name, m in models_ds.items():
+    m.fit(Xds_train, yds_train)
+    p_train, p_test = m.predict(Xds_train), m.predict(Xds_test)
+    img_train, img_test = vote(p_train, g_train), vote(p_test, g_test)
+\end{lstlisting}
+
+\subsubsection*{Results}
+
+\begin{center}
+\begin{tabular}{lccccc}
+\toprule
+ & \multicolumn{2}{c}{Sub-image accuracy} & \multicolumn{3}{c}{Image level (vote)} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-6}
+Model & Train & Test & Train acc & Test acc & Test balanced \\
+\midrule
+LDA                           & 0.783 & 0.517 & 0.862 & 0.540 & 0.326 \\
+QDA (40 PCA components)       & 0.642 & 0.551 & 0.664 & 0.543 & \textbf{0.392} \\
+Logistic Regression           & 0.778 & 0.521 & 0.855 & \textbf{0.558} & 0.323 \\
+Categorical Linear Regression & 0.769 & 0.519 & 0.834 & 0.532 & 0.296 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+ & \multicolumn{2}{c}{Test accuracy} & \multicolumn{2}{c}{Test balanced accuracy} \\
+\cmidrule(lr){2-3} \cmidrule(lr){4-5}
+Model & Full resolution (Q2) & $\texttt{DS} = 8$ & Full resolution (Q2) & $\texttt{DS} = 8$ \\
+\midrule
+LDA                           & 0.396 & 0.540 & 0.290 & 0.326 \\
+QDA (40 PCA components)       & 0.535 & 0.543 & 0.369 & 0.392 \\
+Logistic Regression           & 0.598 & 0.558 & 0.365 & 0.323 \\
+Categorical Linear Regression & 0.561 & 0.532 & 0.449 & 0.296 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{figure}[p]
+  \centering
+  \includegraphics[width=0.82\textwidth]{figures/p2_ds_confusion.png}
+  \caption{Confusion matrices after downsampling ($\texttt{DS} = 8$) and majority voting,
+  on the training set (left) and test set (right).}
+\end{figure}
+
+\[
+\begin{array}{lcc}
+ & \text{Train (vote)} & \text{Test (vote)} \\[4pt]
+\text{LDA} &
+\begin{pmatrix} 2423&124&13&0\\404&1374&14&0\\64&86&567&0\\0&0&0&52 \end{pmatrix} &
+\begin{pmatrix} 504&128&8&0\\257&181&10&0\\73&101&5&0\\4&7&0&1 \end{pmatrix} \\[24pt]
+\text{QDA} &
+\begin{pmatrix} 2035&320&201&4\\746&866&177&3\\136&128&448&5\\0&0&0&52 \end{pmatrix} &
+\begin{pmatrix} 516&124&0&0\\282&164&2&0\\67&101&11&0\\3&5&0&4 \end{pmatrix} \\[24pt]
+\text{Logistic} &
+\begin{pmatrix} 2408&133&19&0\\410&1366&16&0\\74&89&554&0\\0&0&0&52 \end{pmatrix} &
+\begin{pmatrix} 513&121&6&0\\242&188&18&0\\70&96&13&0\\6&6&0&0 \end{pmatrix} \\[24pt]
+\text{Linear Reg.} &
+\begin{pmatrix} 2466&90&4&0\\458&1332&2&0\\116&142&459&0\\10&26&3&13 \end{pmatrix} &
+\begin{pmatrix} 504&132&4&0\\269&175&4&0\\80&98&1&0\\6&6&0&0 \end{pmatrix}
+\end{array}
+\]
+
+\begin{center}
+\begin{tabular}{lcccc}
+\toprule
+Model ($\texttt{DS} = 8$) & Non & VeryMild & Mild & Moderate \\
+\midrule
+LDA                 & 0.79 & 0.40 & 0.03 & 0.08 \\
+QDA                 & 0.81 & 0.37 & 0.06 & 0.33 \\
+Logistic Regression & 0.80 & 0.42 & 0.07 & 0.00 \\
+Linear Regression   & 0.79 & 0.39 & 0.01 & 0.00 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\noindent (Per-class test recall after voting.)
+
+\subsubsection*{Discussion}
+
+\begin{itemize}
+  \item \textbf{Downsampling fixes the more-features-than-samples problem.} With 40{,}968 rows
+  and 2048 features, no model fits the training set perfectly any more: image-level train
+  accuracy is 66--86\% instead of 100\%. The sub-image train/test gap shrinks from 40--60
+  points in Question 2 to about 25 points for LDA, logistic and linear regression, and 9
+  points for QDA. LDA benefits most. Its pooled covariance can now be estimated, it no longer
+  floods the predictions with ModerateDemented, and its test accuracy rises from 39.6\% to
+  54.0\%.
+  \item \textbf{But generalization does not improve overall.} All four models now reach
+  53--56\% test accuracy, only a few points above the 50\% baseline. The best model gets
+  worse: logistic regression drops from 59.8\% to 55.8\%. Balanced accuracy falls for
+  logistic regression and sharply for linear regression (0.449 $\to$ 0.296). The models now
+  almost never recognize MildDemented (at most 7\% recall, vs.\ up to 26\% before) and
+  predict nearly everything as NonDemented or VeryMildDemented. The problem has moved from
+  overfitting (variance) to lost information (bias).
+  \item \textbf{Why.} The 8 sub-images of one MRI are nearly identical shifted copies, so the
+  dataset is not really 8 times larger. It still holds information from only 5121 distinct
+  images, and only 52 ModerateDemented ones. What changes is that each sub-image keeps only
+  every 8th column, discarding most of the horizontal detail that separates neighbouring
+  stages. The fewer features act as regularization, which helps the unstable LDA, but they
+  also remove the signal the better models were using. The copies of the rare class are still
+  memorized: LDA, QDA and logistic regression classify all 52 ModerateDemented training images
+  correctly but get only 0--4 of the 12 test images right.
+  \item \textbf{Majority voting helps a little.} Combining the 8 sub-image predictions raises
+  test accuracy by 1--4 points for LDA, logistic and linear regression (e.g.\ logistic
+  52.1\% $\to$ 55.8\%), and slightly lowers it for QDA (55.1\% $\to$ 54.3\%). Errors on the
+  8 copies are strongly correlated, so voting cannot fix much.
+  \item \textbf{Caveats.} Logistic regression reached \texttt{max\_iter = 500} without
+  converging, so its numbers could change slightly with more iterations. All results come
+  from a single train/test split.
+\end{itemize}
+
+\textbf{Conclusion.} Downsampling with $\texttt{DS} = 8$ makes every method numerically well
+posed and removes the extreme overfitting of Question 2, which matters most for LDA. It
+does not make the models better at recognizing dementia: the ``new'' images carry no new
+information, and keeping every 8th column discards useful detail. Better options would be
+to downsample in both directions (for example, averaging $2 \times 2$ or $4 \times 4$ pixel
+blocks, which keeps the image shape), to try a smaller \texttt{DS}, to use PCA, or to
+reweight the classes so the rare dementia stages are not ignored.
+
+\end{document}
